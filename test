@@ -1,0 +1,255 @@
+library(shiny)
+library(plyr)
+library(dplyr)
+library(data.table)
+library(tictoc)
+library(randomForest)
+library(stringr)
+library(htmlwidgets)
+library(XLConnect)
+library(DT)
+library(dichromat)
+source("scripts/utilities.R")
+
+ui <- fluidPage(
+  sidebarLayout(
+    sidebarPanel(
+      fileInput("file1", "Choose File (.csv, .txt, .rds):",
+                accept = c(
+                  "text/csv/RDS/rds",
+                  "text/comma-Semicolon-values,text/plain",
+                  ".csv", ".txt", ".rds", ".RDS")
+      ),
+      h5(strong("\n  Welcome to the clusterization App")),
+      uiOutput("varsToCluster"),
+      uiOutput("varsToShow"),
+      uiOutput("varScore"),
+      h5(strong("\n  Please select the number of clusters and the sample proportion in number or percentile")),
+      splitLayout(cellWidths = c("25%", "30%", "5%", "30%"),
+                  numericInput(inputId = "numClusters",
+                               label = "Num Clusters", 
+                               value = 3, 
+                               min = 0, 
+                               max = 100, 
+                               step = 1,
+                               width = '50%'),
+                  uiOutput("numCustomers"),
+                  h4("\n  "),
+                  numericInput(inputId = "percCustomers",
+                               label = "% Customers", 
+                               value = NULL, 
+                               min = 0, 
+                               max = 100, 
+                               step = 0.0001,
+                               width = '50%')),
+      checkboxInput(inputId ="scaleData", 
+                    label = "Do you want to scale the data?", value = TRUE, width = NULL),
+      actionButton("clusterTime", "Launch Clustering"),
+      h4(strong("\n  Please select the files you want to save:")),
+      splitLayout(cellWidths = c("50%","25%", "25%"),
+                  h5(strong("\n Top riskiest with cluster")),
+                  radioButtons("filetype1", NULL,
+                               choices = c(".csv", ".rds"), inline = TRUE),
+                  downloadButton("downloadClusters", "Download")),
+      splitLayout(cellWidths = c("50%","25%", "25%"),
+                  h5(strong("\n Clusterization summary")),
+                  h4("\n  "),
+                  downloadButton("downloadSummary", "Download"))
+      
+    ),
+    mainPanel(
+      DT::dataTableOutput("DT_deepDiveDynamicClusterTable")
+    )
+  )
+)
+
+
+server <- function(input, output, session){
+  options(shiny.maxRequestSize = 6000*1024^2)
+  
+  globalVars <- eventReactive( {input$file1} , {
+    inFile <- input$file1
+    if (is.null(inFile))
+      return(NULL)
+    
+    
+    if(grepl(".rds$|.RDS$", inFile$name)){
+      dt <- readRDS(inFile$datapath)
+    } else {
+      dt <- fread(inFile$datapath)
+      #, header = input$header, sep = input$sep)
+    }
+    varsInTable <- unique(names(dt))
+    nrows <- as.numeric(nrow(dt))
+    
+    list( dt = dt, varsInTable = varsInTable, nrows = nrows)
+    
+  })
+  output$varsToCluster <- renderUI({
+    selectizeInput(inputId = "selectVarToCluster", label = "Select variables to be used for clusterization", 
+                   choices = globalVars()$varsInTable, selected = NULL, multiple = TRUE,
+                   options = NULL, width = "80%")
+    
+  }) 
+  output$varsToShow <- renderUI({
+    selectizeInput(inputId = "selectVarToShow", label = "Select variables to be shown in the clustering summary", 
+                   choices = globalVars()$varsInTable, selected = NULL, multiple = TRUE,
+                   options = NULL, width = "80%")
+  })
+  
+  output$varScore <- renderUI({
+    selectInput(inputId = "score", 
+                label = "Select the variable containing the score",
+                choices = globalVars()$varsInTable,
+                selected = NULL, multiple = FALSE,
+                selectize = FALSE, width = "80%", size = NULL)
+    
+  })
+  
+  output$numCustomers <- renderUI({
+    numericInput(inputId = "numCustomers",
+                 label = "N Customers", 
+                 value = globalVars()$nrows, 
+                 min = 0, 
+                 max = globalVars()$nrows, 
+                 step = 1,
+                 width = '70%')
+    
+  })
+  
+  observeEvent(input$numCustomers, {
+    #req(input$numCustomers)
+    if(is.na(input$numCustomers)){
+      updateNumericInput(session, "percCustomers", value =  0)
+    } else {
+      x <- round(input$numCustomers / globalVars()$nrows, 4) * 100
+      if (x > 100){
+        updateNumericInput(session, "percCustomers", value =  100)
+      } else {
+        updateNumericInput(session, "percCustomers", value =  x)
+      }
+    }
+    
+  })
+  
+  observeEvent(input$percCustomers, {
+    #req(input$percCustomers)
+    if(is.na(input$percCustomers)){
+      updateNumericInput(session, "numCustomers", value = 0 )
+    } else {
+      y <- round(input$percCustomers / 100 * globalVars()$nrows)
+      if (y > globalVars()$nrows){
+        updateNumericInput(session, "numCustomers", value = globalVars()$nrows )
+      } else {
+        updateNumericInput(session, "numCustomers", value = y )
+      }
+    }
+  })
+  clusterizationData <- eventReactive(input$clusterTime, {
+    print(getwd())
+    print(file.exists("auxFiles/clusteringTemplate.xlsx"))
+    clusters <- kMeansClustering(dt = globalVars()$dt, 
+                                 clusteringVarnames = input$selectVarToCluster,
+                                 shownVarnames = input$selectVarToShow,
+                                 nClusters = input$numClusters,
+                                 scoreColName = input$score,
+                                 nRowsToCluster = input$numCustomers,
+                                 percRowsToCluster = NULL,
+                                 scaleData = input$scaleData,
+                                 file = NULL,
+                                 template = "auxFiles/clusteringTemplate.xlsx",
+                                 plotFilename = NULL,
+                                 plotSampleSize = 500, 
+                                 verbose = TRUE)
+    print(input$score)
+    
+    clustersSummary <- clusters$report
+    clustersSummary[, (setdiff(names(clustersSummary),c("usedForClustering", "cluster"))) := lapply(.SD, function(x){round(x, 3)}), .SDcols = (setdiff(names(clustersSummary),c("usedForClustering", "cluster")))]
+    clusters <- clusters$clusteredData
+    list(clustersSummary = clustersSummary, clusters = clusters)
+  })
+  
+  output$DT_deepDiveDynamicClusterTable <- DT::renderDataTable({
+    
+    n_months <- (clusterizationData()$clustersSummary %>% ncol) - 2
+    print(n_months)
+    palettes <- gsub(', ', '", "', paste(colorRampPalette(c("#F8696B","#FFEB84","#63BE7B"))(n_months), collapse=", "))
+    print(palettes)
+    palettes <- sprintf('"%s"',palettes)
+    
+    return(DT::datatable(
+      clusterizationData()$clustersSummary,
+      rownames = TRUE,
+      extensions = 'FixedColumns',
+      options = list(
+        scrollX = TRUE,
+        fixedColumns = list(leftColumns = 1, rightColumns=0),
+        lengthMenu = list(c(5, 15, -1), c('5', '15', 'All')),
+        pageLength = -1,
+        rowCallback = JS(sprintf('
+                                 function(nRow, aData, iDisplayIndex, iDisplayIndexFull) {
+                                 // Bold and green cells for conditions
+                                 var defColors= [ %s ];
+                                 console.log(aData.length);
+                                 var valData=[];
+                                 for (var i = 0; i < aData.length -3; i++) {
+                                 valData.push(parseFloat(aData[i+2]));
+                                 };
+                                 valData.sort(function(a,b){return a - b});
+                                 
+                                 console.log("aData", aData);
+                                 console.log("valData", valData);
+                                 
+                                 for (var i = 1; i < aData.length; i++) {
+                                 var targetCell = "td:eq(" + i + ")";
+                                 //var colCell = defColors[i];
+                                 var colCell = defColors[valData.indexOf(parseFloat(aData[i]))];
+                                 console.log("Test",i, targetCell, aData[i], valData.indexOf(parseFloat(aData[i])), colCell);
+                                 //console.log(valData.indexOf(parseFloat(aData[i])));
+                                 //console.log(colCell);
+                                 $(targetCell, nRow).css("background-color", colCell);
+                                 }
+                                 }', palettes)))))
+
+})
+  
+  output$downloadClusters <- downloadHandler(
+    # This function returns a string which tells the client
+    # browser what name to use when saving the file.
+    filename = function(){
+      paste0("clusterization_output", input$filetype1)
+    },
+    # This function should write data to a file given to it by
+    # the argument 'file'
+    content = function(file){
+      fileType <- switch(input$filetype1, ".csv" = ".csv", ".rds" = ".rds")
+      if (fileType == ".rds"){
+        saveRDS(clusterizationData()$clusters, file)
+      } else {
+        fwrite(clusterizationData()$clusters, file, sep = ";")
+      }
+    }
+  )
+  
+  output$downloadSummary <- downloadHandler(
+    # This function returns a string which tells the client
+    # browser what name to use when saving the file.
+    filename = function(){
+      paste0("clusterization_summary", ".xlsx")
+    },
+    # This function should write data to a file given to it by
+    # the argument 'file'
+    content = function(file){
+      clustersSummary <- clusterizationData()$clustersSummary
+      str(file)
+      saveClustersSummary(clustersSummary = clustersSummary,
+                          file = file,
+                          template = "auxFiles/clusteringTemplate.xlsx")
+      
+    })
+  }
+
+options(shiny.port = 5556,
+        # shiny.host = "172.20.35.58",
+        shiny.launch.browser = T, shiny.trace = T)
+shinyApp(ui, server)
