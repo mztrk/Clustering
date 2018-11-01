@@ -1,0 +1,333 @@
+
+#Auxiliary function to plot the relationship between clustering variables
+createCorrelationPlots <- function(filename, df, sampleSize = 500) {
+  if(!is.null(filename)){
+    corrPlot <- ggpairs(sample_n(df, sampleSize), aes(col="red", alpha=0.4), diag=list(continuous="density"), axisLabels='show')
+    png(filename, height=1500, width=1500)
+    print(corrPlot)
+    dev.off()
+  }
+}
+
+
+#' Function to create clusters and a standard report of the mean of some variables 
+#' The clustering is performed using kmeans algorith with the euclidean distance
+#' Character and factor variables will be dummified before entering the clustering
+#' As kmeans does not admit Infinite or NA values, they are na.roughfix'd (replaced by the median)
+#' 
+#'
+#' @param dt Master table with the prediction
+#' @param clusteringVarnames Names of the variables that will be used for the clustering
+#' @param shownVarnames Variables that will be included in the report but not used for the clustering
+#' @param nClusters Number of clusters that will be created
+#' @param scoreColName Name of the column that contains the model score, used for clustering only the highest values
+#' @param nRowsToCluster Number of rows that will be considered for the clustering. Incompatible with "percRowsToCluster"
+#' @param percRowsToCluster Percentage of rows that will be considered for the clustering. Incompatible with "nRowsToCluster"
+#' @param scaleData Whether to scale data before clustering or not (subtract mean and divide by sd). 
+#'                  Recommended to set as true as euclidean distance is sensitive to order of magnitude of data
+#' @param file Name of the file where the report will be saved (must be an xlsx file)
+#' @param template Excel template where the format and coloring of the output file is saved
+#' @param plotFilename Name of the file where a correlation plot of the different clustering variables will be saved
+#'                     The output will be saved as png. If NULL no plotting will be done
+#' @param plotSampleSize Sample size that will be used for the plot, as most likely all data won't be manageable
+#' @param verbose If TRUE, prints some information about its execution
+#'
+#' @return returns a list with two elements:
+#'          clusteredData: The data that has been clustered with the clustering information
+#'          report: The summary report of the clusters
+#' @export
+#'
+#' @examples
+kMeansClustering <- function(dt, 
+                             clusteringVarnames,
+                             shownVarnames,
+                             nClusters,
+                             scoreColName,
+                             nRowsToCluster = NULL,
+                             percRowsToCluster = NULL,
+                             scaleData = TRUE,
+                             file = NULL,
+                             template = NULL,
+                             plotFilename = NULL,
+                             plotSampleSize = 500, 
+                             verbose = TRUE){
+  
+  originalColNames <- colnames(dt)
+  setorderv(dt, scoreColName, order = -1)
+  
+  #Error control
+  if(!is.null(nRowsToCluster) & !is.null(percRowsToCluster)){
+    stop("Only one of the following nRowsToCluster or percRowsToCluster should be not NULL")
+  }
+  if(!is.null(nRowsToCluster)){
+    rowsForClustering <- nRowsToCluster
+  }else if(!is.null(percRowsToCluster)){
+    rowsForClustering <- ceiling(percRowsToCluster * nrow(dt))
+  }else{
+    stop("Only one of the following nRowsToCluster or percRowsToCluster should be not NULL")
+  }
+  #We cant add to the clustering more variables than the table has
+  rowsForClustering <- min(nrow(dt), rowsForClustering)
+  
+  #######################################################################
+  ### Dummify factor and character variables
+  #######################################################################
+  tic()
+  cond_cat(verbose, "Dummifying factors and characters...\n")
+  
+  varsToTreat <- unique(c(clusteringVarnames, shownVarnames))
+  
+  varsToDummify <- intersect(varsToTreat, colnames(dt)[sapply(dt,class) %in% c("factor","character")])
+  numericVars <- setdiff(varsToTreat, varsToDummify)
+  
+  #Store the new dummified variables names so that we add them to the clustering afterwards
+  dummifiedVars <- c()
+  dummifiedVarsForClustering <- c()
+  for(varToDummify in varsToDummify){
+    vals <- unique(dt[[varToDummify]])
+    dt[, (varToDummify %+% "_" %+% vals) := lapply(vals, function(x){as.numeric(get(varToDummify) == x)})]
+    dummifiedVars <- c(dummifiedVars, varToDummify %+% "_" %+% vals)
+    if(varToDummify %in% clusteringVarnames){
+      dummifiedVarsForClustering <- c(dummifiedVarsForClustering, varToDummify %+% "_" %+% vals)
+    }
+  }
+  
+  #Add the dummy variables to the clustering. We put them in this patricular order so that all clustering variables are at the beginning
+  varsToTreat <- c(dummifiedVarsForClustering, numericVars, setdiff(dummifiedVars, dummifiedVarsForClustering))
+  clusteringVarnames <- c(dummifiedVarsForClustering, 
+                          intersect(numericVars, clusteringVarnames))
+  toc(quiet = !verbose)
+  
+  #######################################################################
+  ### Clustering
+  #######################################################################
+  
+  #Only clusterize the top N rows
+  topClusterized <- dt[1:rowsForClustering]
+  dataToKmeans <- topClusterized[, clusteringVarnames, with = FALSE]
+  
+  tic()
+  cond_cat(verbose, "Removing infinite values...\n")
+  dataToKmeans <- dataToKmeans[, lapply(.SD, function(x){ifelse(is.infinite(x), NA, x)})]
+  toc(quiet = !verbose)
+  
+  tic()
+  cond_cat(verbose, "Checking columns quality...\n")
+  x <- sapply(clusteringVarnames, function(x){uniqueN(dataToKmeans[[x]], na.rm = T)})
+  if(any(x == 1)){
+    stop("Variables: " %+% paste(names(x)[x==1], collapse = ", ") %+% " have at most one non-NA value, which makes it unable to do kmeans on them, please run the clustering without these variables.")
+  }
+  toc(quiet = !verbose)
+  
+  if(scaleData){
+    tic()
+    cond_cat(verbose, "Scaling data...\n")
+    dataToKmeans <- scale(dataToKmeans)
+    toc(quiet = !verbose)
+  }
+  
+  if(!is.null(plotFilename)){  
+    tic()
+    cond_cat(verbose, "Plotting correlations...\n")
+    createCorrelationPlots(plotFilename, topClusterized[, clusteringVarnames, with = FALSE], sampleSize = plotSampleSize)
+    toc(quiet = !verbose)
+  }
+  
+  tic()
+  cond_cat(verbose, "Running kmeans...\n")
+  set.seed(1804)
+  auxKMeans <- kmeans(na.roughfix(dataToKmeans), centers= nClusters)
+  
+  #We will redefine the clusters numeration so that cluster 1 is the smallest and cluster N is the largest
+  #This is done because the reports orders the clusters by size
+  clustersNewOrder <- names(sort(table(auxKMeans$cluster))) #This sorts the clusters by size
+  topClusterized[, cluster := "Cluster_" %+% str_pad(mapvalues(auxKMeans$cluster, clustersNewOrder, seq_len(nClusters)), width = 2, side = "left", pad = "0")]
+  
+  toc(quiet = !verbose)
+  print(paste0("template file exists: ", file.exists(template)))
+  clustersSummary <- summarizeClusters(clusteredTable = topClusterized,
+                                       varsToShow = varsToTreat,
+                                       file = file,
+                                       template = template,
+                                       allPopulationTable = dt,
+                                       clusteringVarnames = clusteringVarnames,
+                                       verbose = verbose)
+  
+  
+  return(list(clusteredData = topClusterized, report = clustersSummary))
+}
+
+#' Function that creates a summary report with the mean of some variables for each cluster
+#'
+#' @param clusteredTable Data that has been clustered
+#' @param varsToShow Names of the variables that will be shown in the report
+#' @param file Name of the file where the report will be saved (must be an xlsx file)
+#' @param template Excel template where the format and coloring of the output file is saved
+#' @param allPopulationTable Table with info about all the data. 
+#'      Useful when not all the data has been clusteredand want to compare the clustered data vs all the population
+#' @param clusterColName Name of the column that contains the cluster
+#' @param clusteredTableName Name that will be given in the report to the clustered Table
+#' @param clusteringVarnames Variables that were used for the clustering. If any, a column will be added to the report telling if the variable was used for the clustering or its just being displayed.
+#' @param verbose If TRUE, prints some information about its execution
+#'
+#' @return Returns the clusters summary report
+#' @export
+#'
+#' @examples
+summarizeClusters <- function(clusteredTable,
+                              varsToShow,
+                              file = NULL,
+                              template = NULL,
+                              allPopulationTable = NULL,
+                              clusterColName = "cluster",
+                              clusteredTableName = "Top Risky",
+                              clusteringVarnames = c(),
+                              verbose = FALSE
+){
+  
+  tic()
+  cond_cat(verbose, "Creating clusters report...\n")
+  
+  clusteredTable[, clusterSize := .N, by=.(cluster)]
+  clusteredTable[, clusterPercentage := .N / nrow(clusteredTable), by = cluster]
+  
+  if(!is.null(allPopulationTable)){
+    allPopulationTable[, clusterSize := nrow(allPopulationTable)]
+    allPopulationTable[, cluster := "Total Population"]
+    allPopulationTable[, clusterPercentage := 1]
+  }
+  unclusteredTable <- copy(clusteredTable)
+  unclusteredTable[, clusterSize := nrow(unclusteredTable)]
+  unclusteredTable[, cluster := clusteredTableName]
+  unclusteredTable[, clusterPercentage := 1]
+  
+  masterTable <- rbind(clusteredTable, unclusteredTable, allPopulationTable, fill=TRUE)
+  
+  clustersSummary <- masterTable[, lapply(.SD, mean, na.rm=TRUE), by=.(cluster), .SDcols = c("clusterSize", "clusterPercentage", varsToShow)]
+  setorder(clustersSummary, clusterSize)  
+  #Transpose to make the data more readable
+  varNames <- colnames(clustersSummary)
+  clustersSummary <- transpose(clustersSummary)
+  clustersSummary <- cbind(data.table(Cluster = varNames), clustersSummary)
+  clustersSummary[, sapply(.SD, first)]
+  setnames(clustersSummary, sapply(clustersSummary, first))
+  clustersSummary <- clustersSummary[-1]
+  clustersSummary[, (colnames(clustersSummary)[-1]) := lapply(.SD, as.numeric), .SDcols = colnames(clustersSummary)[-1]]
+  if(length(clusteringVarnames) != 0){
+    clustersSummary[, usedForClustering := ifelse(varNames[-1] %in% clusteringVarnames, "Yes", "No")]
+  }
+  
+  saveClustersSummary(clustersSummary = clustersSummary,
+                      file = file,
+                      template = template)
+  
+  toc(quiet = !verbose)
+  
+  return(clustersSummary)
+  
+}
+
+#' Saves the clusters summary report to an Excel file based on a template
+#'
+#' @param clustersSummary Clusters report (output from summarizeClusters)
+#' @param file Name of the file where the report will be saved (must be an xlsx file)
+#' @param template Excel template where the format and coloring of the output file is saved
+#'
+#' @return Nothing
+#' @export
+#'
+#' @examples
+saveClustersSummary <- function(clustersSummary,
+                                file = NULL,
+                                template = NULL){
+  
+  
+  if (!is.null(file)) {
+    if(!is.null(template)){
+      if(!file.exists(template)){
+        warning("The provided template does not exist, running without template")
+        wb <- XLConnect::loadWorkbook(file, create=TRUE)
+      }else{
+        wb <- XLConnect::loadWorkbook(template, create=TRUE)
+      }
+    }else{
+      wb <- XLConnect::loadWorkbook(file, create=TRUE)
+    }
+    XLConnect::createSheet(wb,name="clustersSummary")
+    
+    setStyleAction(wb,XLC$STYLE_ACTION.NONE)
+    
+    XLConnect::writeWorksheet(wb,clustersSummary,sheet="clustersSummary", startRow=1, startCol=1)
+    cs <- createCellStyle(wb)
+    for(row in seq_len(nrow(clustersSummary))){
+      if(all(sapply(clustersSummary[row, -c("cluster", "usedForClustering"), with = FALSE], function(x){x %between% c(0,1)}))){
+        XLConnect::setCellStyle(wb, "clustersSummary!B" %+% (row+1) %+% ":ZZ" %+% (row+1), cellstyle = cs)
+      }
+    }
+    
+    XLConnect::setBorder(cs, side = "all", type = XLC$BORDER.THIN, color = XLC$COLOR.BLACK)
+    XLConnect::setDataFormat(cs, "0%")
+    
+    XLConnect::saveWorkbook(wb, file=file)
+    
+  }
+  
+  return(invisible(NULL))
+}
+
+
+
+
+#---------------------------------------------------------------------------------------
+
+`%gn%` <- function(x, y) {
+  grep(y, ignore.case = T, x = names(x))
+}
+
+#' Wrapper for grepping values. Is NOT case sensitive
+#'
+#' @param x String vector
+#' @param y Pattern
+#'
+#' @return Elements of string that fit the pattern
+#' @export
+#'
+#' @examples
+#' 
+#' c("hola", "adios", "cocacola") %gv% "ola"
+#' 
+`%gv%` <- function(x, y) {
+  grep(y, ignore.case = T, x = x, value = T)
+}
+
+`%g%` <- function(x, y) {
+  grep(y, ignore.case = T, x = x)
+}
+
+#' Wrapper for paste0. Easy, simple and fast way to concatenate two strings.
+#'
+#' @param x
+#' @param y
+#'
+#' @return 
+#' @export
+#'
+#' @examples
+`%+%` <- function(x, y) {
+  paste0(x,y)
+}
+
+#' Conditional cat
+#'
+#' @param condFlag If TRUE, message in printed, otherwise not
+#' @param ... Message
+#'
+#' @return
+#' @export
+#'
+#' @examples
+cond_cat <- function(condFlag = TRUE, ...){
+  if(condFlag){
+    cat(...)
+  }
+}
